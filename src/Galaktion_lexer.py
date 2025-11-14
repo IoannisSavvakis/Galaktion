@@ -403,8 +403,6 @@ def runTest(data):
         print(tok, tok.lineno, type(tok))
 
 
-with open('D:/Galaktion/src/test.gal', 'r') as f:
-    data = f.read()
 data = """ //refs[-1~]/@sps_id """
 
 # runTest(str(data))
