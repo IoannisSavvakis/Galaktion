@@ -1,65 +1,87 @@
+# Galaktion_parser.py
+
 import ply.yacc as yacc
 from Galaktion_lexer import tokens, newLexer
 import os
 import sys
-import argparse
 from pathlib import Path
-import xml.etree.ElementTree as ET
+from lxml import etree
 import json
+import csv
 import pandas as pd
 import re
+from enum import Enum
 import Galaktion_core as G
-from Galaktion_core import ExpressionType as ExprT, Expression, Symbol, SymbolType as SymT, Checks, ActivationRecord, ActivationRecordManager
+from Galaktion_core import ExpressionType as ExprT, Expression, Symbol, SymbolType as SymT, Checks, Directives
 
 
 ############## Variables ##############################
 
-
-couldNotLink = False
-
-
-UI = G.UserInterface(True)
+UI = G.UserInterface()
 symbolTable = G.SymbolTable()
 
-srcFiles = G.SourceFileManager()
-
-activRecs = ActivationRecordManager()
-activRecs.push(ActivationRecord(newLexer()))
-activRecs.top().linkingFiles = []
+userSrcFiles = G.Stack()
 
 
 linkCode = None
+linkCodeStartingLine = 0
 linkSubfolders = None
 currentSrcElement = None
 fileLocation = None
 fileName = None
 
 
-afterErrorExpression = Expression(ExprT.NONE, True)
+activeLoopCounter = 0
 
+
+afterErrorExpression = Expression(ExprT.NONE, True)
 
 ######################################################
 
 
-#################### Methods #############################
+#################### Functions #############################
+
+def getDynamicXPathVariables(expr: str):
+    vars = re.findall(r'\$[a-zA-Z_0-9]+', str(expr))
+
+    definedVars = {}
+    undeclaredVars = []
+
+    for var in vars:
+        val = symbolTable.get(var)
+
+        if val == None:
+            undeclaredVars.append(var)
+            continue
+
+        val = val.value
+        if type(val) == list:
+            val = [i.value for i in val]
+
+        definedVars[var[1:]] = val
+
+    return (definedVars, undeclaredVars)
 
 
 def checkIndex(e: Expression, line: int):
-    global UI, afterErrorExpression
+    global UI
 
-    if e.type != ExprT.ARITHMETIC:
-        UI.emitError(G.Error('Indeces should be integer numbers', line))
+    if e == None or e.type != ExprT.ARITHMETIC:
+        UI.emitError(
+            G.Error('non-Integer index', line))
         return afterErrorExpression
     else:
         idx = e.value
+
         if type(idx) == float:
-            UI.emitWarning(G.Warning('Floating point index', line))
+            UI.emitWarning(
+                G.Warning('Floating point index - treated as integer', line))
             idx = int(idx)
 
         return G.Index(idx)
 
 
-#   Degrees Minutes Seconds to Decimal Degrees
+# Degrees Minutes Seconds to Decimal Degrees
 def DMStoDD(dmsString):
     dms = [0, 0, 0]
     extracted = re.findall(r'[-+]?\d*\.\d+|\d+', dmsString)
@@ -82,7 +104,7 @@ def findFile(place, fileName):
         if i.is_file() and i.name == fileName:
             return str(i.resolve())
 
-        if i.is_dir():
+        if i.is_dir() and linkSubfolders:
             f = findFile(i.resolve(), fileName)
 
             if f != None:
@@ -91,28 +113,21 @@ def findFile(place, fileName):
     return None
 
 
-def getPath2File(root, pathType='relative'):
-    global currentSrcElement, fileName, fileLocation
+class PathType(Enum):
+    RELATIVE = 0
+    ABSOLUTE = 1
+
+
+def getPath2File(root, pathType: PathType = PathType.RELATIVE):
+    global fileName, fileLocation
 
     assert (currentSrcElement != None)
-
-    activRecs.push(ActivationRecord(
-        lexer=newLexer(),
-        code=linkCode[1:-1]
-    ))
-    parser.parse(activRecs.top().code,
-                 lexer=activRecs.top().lexer)
-    activRecs.pop()
-
-    currentSrcElement = None
-
+    parser.parse(linkCode[1:-1], lexer=newLexer(linkCodeStartingLine))
     assert (fileLocation != None and fileName != None)
 
     fileLocation.value = root + '/' + fileLocation.value
 
     if len(fileLocation.value) < len(root + '/'):
-        # print('fileLocation:', fileLocation)
-        # print('root:', root+'/')
         return None
     assert len(fileLocation.value) >= len(root + '/')
 
@@ -124,10 +139,10 @@ def getPath2File(root, pathType='relative'):
     if absPath == None:
         return None
 
-    if pathType == 'relative':
+    if pathType == PathType.RELATIVE:
         return absPath[len(root)+1:]
 
-    if pathType == 'absolute':
+    if pathType == PathType.ABSOLUTE:
         return absPath
 
     # error - invalid argument
@@ -158,6 +173,7 @@ def getLatLong(val):
 # For the source file having the coordinates written first long then lat
 def getLongLat(val):
     if val == None:
+        return None
         lat = None
         long = None
     elif '\u00b0' in val:
@@ -175,67 +191,82 @@ def getLongLat(val):
     }
 
 
-def exec_foreach_folder(folder, block, temp, directives):
+class BreakStatement(Exception):
+    pass
+
+
+class ContinueStatement(Exception):
+    pass
+
+
+def exec_foreach_folder(folder, block, line, temp, directives):
     try:
+        lexer = newLexer(line)
+
         for i in Path(folder).iterdir():
             file = folder+'/'+i.name
 
             if i.is_dir():
-                if '@subfolders' in directives:
-                    exec_foreach_folder(file, block, temp, directives)
+                if Directives.subfolders in directives:
+                    exec_foreach_folder(file, block, line,
+                                        temp, directives)
             elif not Checks.isXMLfile(file):
                 continue
             else:
-                code = temp + " = '" + file + "'\nfrom " + temp + block
+                fileVar = temp if temp != None else symbolTable.hidden()
+                code = 'from xmlfile ' + fileVar + " := '" + file + "' " + \
+                    block  # keep the {} for the 'from' to be scoped!
+                lexer.lineno = line
+                try:
+                    parser.parse(code, lexer)
+                except ContinueStatement:
+                    pass
 
-                activRecs.push(ActivationRecord(
-                    lexer=newLexer(),
-                    code=code
-                ))
-                parser.parse(activRecs.top().code,
-                             lexer=activRecs.top().lexer)
-                activRecs.pop()
-    except FileNotFoundError:
-        UI.emitError(G.Error('File not found'))
+                if temp == None:
+                    symbolTable.delete(fileVar)
+
+    except FileNotFoundError as e:
+        UI.emitError(G.Error(f'Folder "{folder}" not found'))
 
 
-def exec_foreach_list(l, block, temp, directives):
-    for i in l:
-        iASstr = (("'" if i.type == ExprT.STRING else "") +
-                  str(i) + ("'" if i.type == ExprT.STRING else ""))
-        code = temp + " = " + iASstr + '\n' + block[1:-1]
+def exec_foreach_array(l, block, line, temp, directives):
+    for i in l.value:
+        iASstr = (("'" if i.type.value <= ExprT.STRING.value else "") +
+                  str(i) + ("'" if i.type.value <= ExprT.STRING.value else ""))
 
-        activRecs.push(ActivationRecord(
-            lexer=newLexer(),
-            code=code
-        ))
-        parser.parse(activRecs.top().code,
-                     lexer=activRecs.top().lexer)
-        activRecs.pop()
+        code = ''
+        if temp != None:
+            code = temp + " := " + iASstr + ' '
+        code += block[1:-1]
+
+        try:
+            parser.parse(code, lexer=newLexer(line))
+        except ContinueStatement:
+            pass
+
+        if temp != None:
+            tempSym = symbolTable.get(temp)
+
+            i.type = ExprT.bySymbol(tempSym)
+            i.value = tempSym.value
 
 
 def p_error(p):
-    print("Syntax error in input:", p.value)
-    sys.exit()
-
+    UI.emitError(G.Error("Syntax error in input: " + p.value, p.lineno))
 
 #########################################################
 
 
 ###################### Grammar #############################
-
-
 precedence = (
-    ('right', 'EQUAL', 'COLON'),
-    ('left', 'COLON_COLON'),
+    ('right', 'ASSIGN_VAR', 'ASSIGN_CONST'),
+    ('left', 'SLICER'),
     ('left', 'OR'),
     ('left', 'AND'),
-    ('nonassoc', 'EQUAL_EQUAL', 'GREATER_LESS'),
+    ('nonassoc', 'EQUAL', 'NOT_EQUAL'),
     ('nonassoc', 'GREATER', 'GREATER_EQUAL', 'LESS', 'LESS_EQUAL'),
-    ('left', 'PLUS', 'MINUS', 'PLUS_PLUS'),
+    ('left', 'PLUS', 'MINUS', 'MUL', 'DIV', 'MOD', 'EXTEND'),
     ('right', 'NOT', 'UMINUS', 'UPLUS'),
-    # ('left', 'ARROW'),
-    # ('left', 'SLASH'),  # very important to have greater precedence than ARROW
     ('left', 'BRACE_L', 'BRACE_R'),
     ('left', 'PAR_L', 'PAR_R'),
 )
@@ -251,22 +282,23 @@ def p_empty(p):
 
 def p_program(p):
     '''
-    program : stmts
+    program : empty
+            | stmts
     '''
 
 
 def p_stmts(p):
     '''
-    stmts : empty
-          | stmt
+    stmts : stmt
           | stmts stmt
     '''
 
 
-# TODO break continue
 def p_stmt(p):
     '''
-    stmt : expr
+    stmt : DUMMY_STMT
+         | exitstmt
+         | expr
          | decl
          | linkdef
          | linkexec
@@ -280,61 +312,99 @@ def p_stmt(p):
          | generatestmt
          | CURLY_BRACE_L BLOCK_WITH_CODE
     '''
+    global activeLoopCounter
+
+    assert activeLoopCounter >= 0
+
+    if p[1] in ['break', 'continue']:
+        if activeLoopCounter == 0:
+            p[0] = afterErrorExpression
+            UI.emitError(G.Error(f'"{p[1]}" statement outside of a loop'))
+        else:
+            if p[1] == 'break':
+                raise BreakStatement
+            raise ContinueStatement
+
+
+def p_exitstmt(p):
+    '''
+    exitstmt : EXIT
+    '''
+    sys.exit()
 
 
 def p_linkdef(p):
     '''
     linkdef : ARROW BLOCK_WITH_CODE
     '''
-    global linkCode
+    global linkCode, linkCodeStartingLine
     linkCode = p[2]
+    linkCodeStartingLine = p.lineno(2)
 
 
 def p_linkexec(p):
     '''
-    linkexec : VERTICAL_BAR expr VERTICAL_BAR drctvs COMMA VERTICAL_BAR expr VERTICAL_BAR drctvs
+    linkexec : expr drctvs COMMA expr drctvs
     '''
     global fileLocation, fileName, linkSubfolders
-    err = False
 
-    if '@filelocation' in p[4] and '@filename' in p[9]:
-        p[4].remove('@filelocation')
-        p[9].remove('@filename')
+    directivesError = False
 
-        fileLocation = p[2]
-        fileName = p[7]
+    if Directives.filelocation in p[2] and Directives.filename in p[5]:
+        if p[1].type.value > ExprT.STRING.value:
+            p[0] = afterErrorExpression
+            UI.emitError(G.Error(
+                f'File location in "->" code block must be an expression of type {ExprT.STRING.name}, not {p[1].type.name}', p.lineno(1)))
+        elif p[4].type.value > ExprT.STRING.value:
+            p[0] = afterErrorExpression
+            UI.emitError(G.Error(
+                f'File name in "->" code block must be an expression of type {ExprT.STRING.name}, not {p[4].type.name}', p.lineno(4)))
+        else:
+            p[2].remove(Directives.filelocation)
+            p[5].remove(Directives.filename)
 
-        try:
-            p[4].remove('@subfolders')
-            linkSubfolders = True
-        except KeyError:
-            linkSubfolders = False
+            fileLocation = p[1]
+            fileName = p[4]
 
-        if len(p[4]) > 0 or len(p[9]) > 0:
-            err = True
+            try:
+                p[2].remove(Directives.subfolders)
+                linkSubfolders = True
+            except KeyError:
+                linkSubfolders = False
 
-    elif '@filelocation' in p[9] and '@filename' in p[4]:
-        p[9].remove('@filelocation')
-        p[4].remove('@filename')
+            if len(p[2]) > 0 or len(p[5]) > 0:
+                directivesError = True
+    elif Directives.filelocation in p[5] and Directives.filename in p[2]:
+        if p[4].type.value > ExprT.STRING.value:
+            p[0] = afterErrorExpression
+            UI.emitError(G.Error(
+                f'File location in "->" code block must be an expression of type {ExprT.STRING.name}, not {p[4].type.name}', p.lineno(4)))
+        elif p[1].type.value > ExprT.STRING.value:
+            p[0] = afterErrorExpression
+            UI.emitError(G.Error(
+                f'File name in "->" code block must be an expression of type {ExprT.STRING.name}, not {p[1].type.name}', p.lineno(1)))
+        else:
+            p[5].remove(Directives.filelocation)
+            p[2].remove(Directives.filename)
 
-        fileLocation = p[7]
-        fileName = p[2]
+            fileLocation = p[4]
+            fileName = p[1]
 
-        try:
-            p[9].remove('@subfolders')
-            linkSubfolders = True
-        except KeyError:
-            linkSubfolders = False
+            try:
+                p[5].remove(Directives.subfolders)
+                linkSubfolders = True
+            except KeyError:
+                linkSubfolders = False
 
-        if len(p[9]) > 0 or len(p[4]) > 0:
-            err = True
-
+            if len(p[2]) > 0 or len(p[5]) > 0:
+                directivesError = True
     else:
-        err = True
+        directivesError = True
 
-    if err:
+    if directivesError:
         p[0] = afterErrorExpression
-        UI.emitError(G.Error('Invalid directives', p.lineno(1)))
+        UI.emitError(G.Error(
+            f'Invalid directives - unable to perform linking', linkCodeStartingLine))
 
 
 def p_ifstmt(p):
@@ -344,19 +414,9 @@ def p_ifstmt(p):
            | IF expr BLOCK_WITH_CODE ELSE empty ifstmt
     '''
     if bool(p[2]):
-        activRecs.push(ActivationRecord(
-            lexer=newLexer(),
-            code=p[3][1:-1]
-        ))
-        parser.parse(activRecs.top().code, lexer=activRecs.top().lexer)
-        activRecs.pop()
+        parser.parse(p[3][1:-1], lexer=newLexer(p.lineno(1)))
     elif len(p) == 6:
-        activRecs.push(ActivationRecord(
-            lexer=newLexer(),
-            code=p[5][1:-1]
-        ))
-        parser.parse(activRecs.top().code, lexer=activRecs.top().lexer)
-        activRecs.pop()
+        parser.parse(p[5][1:-1], lexer=newLexer(p.lineno(1)))
     else:
         pass
 
@@ -365,24 +425,38 @@ def p_foreachstmt(p):
     '''
     foreachstmt : FOR_EACH decl IN expr BLOCK_WITH_CODE drctvs
     '''
-    if p[4].type == ExprT.LIST:
-        temp = p[2].symbol.name
-        exec_foreach_list(p[4].value, p[5], temp, p[6])
+    global activeLoopCounter
+
+    if p[4].type == ExprT.ARRAY:
+        temp = None if p[2].symbol == None else p[2].symbol.name
+
+        activeLoopCounter += 1
+        try:
+            exec_foreach_array(p[4], p[5], p.lineno(5), temp, p[6])
+        except BreakStatement:
+            pass
+        activeLoopCounter -= 1
+        assert activeLoopCounter >= 0
     elif p[4].type == ExprT.folder:
         if p[2].type != ExprT.xmlfile:
             p[0] = afterErrorExpression
             UI.emitError(G.Error(
-                '"foreach" statement iterating through a folder excpects a "xmlfile" type', p.lineno(1)))
+                '"foreach" statement iterating through a folder excpects a "xmlfile" type', p.lineno(2)))
         else:
-            # fold = symbolTable.get(p[4].symbol.name).value
             fold = p[4].value
-            temp = p[2].symbol.name
+            temp = None if p[2].symbol == None else p[2].symbol.name
 
-            exec_foreach_folder(fold, p[5], temp, p[6])
+            activeLoopCounter += 1
+            try:
+                exec_foreach_folder(fold, p[5], p.lineno(5), temp, p[6])
+            except BreakStatement:
+                pass
+            activeLoopCounter -= 1
+            assert activeLoopCounter >= 0
     else:
         p[0] = afterErrorExpression
         UI.emitError(G.Error(
-            'Tried to iterate through non-iterable type '+str(p[4].type), p.lineno(3)))
+            'Tried to iterate through non-iterable type '+p[4].type.name, p.lineno(4)))
         pass
 
 
@@ -390,18 +464,21 @@ def p_expr(p):
     '''
     expr : assignexpr
          | augmassignexpr
-         | tagslinks
+         | linkedxpathsexpr
          | expr GREATER expr
          | expr GREATER_EQUAL expr
          | expr LESS expr
          | expr LESS_EQUAL expr
-         | expr EQUAL_EQUAL expr
-         | expr GREATER_LESS expr
+         | expr EQUAL expr
+         | expr NOT_EQUAL expr
          | expr AND expr
          | expr OR expr
          | expr PLUS expr
          | expr MINUS expr
-         | expr PLUS_PLUS expr
+         | expr MUL expr
+         | expr DIV expr
+         | expr MOD expr
+         | expr EXTEND expr
          | term
     '''
     if len(p) == 2:
@@ -410,70 +487,119 @@ def p_expr(p):
         err = False
 
         if p[2] == '>':
-            if p[1].type != ExprT.BOOLEAN and p[3].type != ExprT.BOOLEAN:
+            if p[1].type not in [ExprT.NONE, ExprT.BOOLEAN, ExprT.ARRAY] and p[3].type not in [ExprT.NONE, ExprT.BOOLEAN, ExprT.ARRAY]:
                 v = p[1].value > p[3].value
                 p[0] = Expression(ExprT.BOOLEAN, True, value=v)
             else:
                 err = True
+
         elif p[2] == '>=':
-            if p[1].type != ExprT.BOOLEAN and p[3].type != ExprT.BOOLEAN:
+            if p[1].type not in [ExprT.NONE, ExprT.BOOLEAN, ExprT.ARRAY] and p[3].type not in [ExprT.NONE, ExprT.BOOLEAN, ExprT.ARRAY]:
                 v = p[1].value >= p[3].value
                 p[0] = Expression(ExprT.BOOLEAN, True, value=v)
             else:
                 err = True
+
         elif p[2] == '<':
-            if p[1].type != ExprT.BOOLEAN and p[3].type != ExprT.BOOLEAN:
+            if p[1].type not in [ExprT.NONE, ExprT.BOOLEAN, ExprT.ARRAY] and p[3].type not in [ExprT.NONE, ExprT.BOOLEAN, ExprT.ARRAY]:
                 v = p[1].value < p[3].value
                 p[0] = Expression(ExprT.BOOLEAN, True, value=v)
             else:
                 err = True
+
         elif p[2] == '<=':
-            if p[1].type != ExprT.BOOLEAN and p[3].type != ExprT.BOOLEAN:
+            if p[1].type not in [ExprT.NONE, ExprT.BOOLEAN, ExprT.ARRAY] and p[3].type not in [ExprT.NONE, ExprT.BOOLEAN, ExprT.ARRAY]:
                 v = p[1].value <= p[3].value
                 p[0] = Expression(ExprT.BOOLEAN, True, value=v)
             else:
                 err = True
-        elif p[2] == '==':
-            v = p[1].value == p[3].value
+
+        elif p[2] == '=':
+            left = p[1].value
+            right = p[3].value
+            if p[1].type == ExprT.ARRAY:
+                left = [i.value for i in p[1].value]
+            if p[3].type == ExprT.ARRAY:
+                right = [i.value for i in p[3].value]
+
+            v = left == right
             p[0] = Expression(ExprT.BOOLEAN, True, value=v)
-        elif p[2] == '><':
-            v = p[1].value != p[3].value
+
+        elif p[2] == '!=':
+            left = p[1].value
+            right = p[3].value
+            if p[1].type == ExprT.ARRAY:
+                left = [i.value for i in p[1].value]
+            if p[3].type == ExprT.ARRAY:
+                right = [i.value for i in p[3].value]
+
+            v = left != right
             p[0] = Expression(ExprT.BOOLEAN, True, value=v)
+
         elif p[2] == 'and':
             v = bool(p[1]) and bool(p[3])
             p[0] = Expression(ExprT.BOOLEAN, True, value=v)
+
         elif p[2] == 'or':
             v = bool(p[1]) or bool(p[3])
             p[0] = Expression(ExprT.BOOLEAN, True, value=v)
+
         elif p[2] == '+':
-            if (p[1].type == ExprT.ARITHMETIC and p[3].type == ExprT.ARITHMETIC) or (p[1].type == ExprT.STRING and (p[3].type == ExprT.STRING or p[3].type == ExprT.ARITHMETIC)):
+            if (p[1].type == ExprT.ARITHMETIC and p[3].type == ExprT.ARITHMETIC) or (p[1].type.value <= ExprT.STRING.value and p[3].type != ExprT.ARRAY):
                 v = p[1].value + (
-                    str(p[3].value) if p[1].type == ExprT.STRING and p[3].type == ExprT.ARITHMETIC else p[3].value
+                    p[3].value if p[1].type == ExprT.ARITHMETIC else str(p[3])
                 )
                 p[0] = Expression(p[1].type, True, value=v)
-            elif p[1].type == ExprT.LIST:
+            elif p[1].type == ExprT.ARRAY:
                 p[1].value.append(Expression(
                     p[3].type,
                     False,
                     None,
-                    p[3].value if p[3].type != ExprT.LIST else [
+                    p[3].value if p[3].type != ExprT.ARRAY else [
                         i for i in p[3].value],
-                    listItem=True
+                    arrayItem=True
                 ))
                 v = p[1].value
                 p[0] = Expression(p[1].type, True, value=v)
             else:
                 err = True
+
         elif p[2] == '-':
             if p[1].type == ExprT.ARITHMETIC and p[3].type == ExprT.ARITHMETIC:
                 v = p[1].value - p[3].value
                 p[0] = Expression(p[1].type, True, value=v)
             else:
                 err = True
+
+        elif p[2] == '*':
+            if (p[1].type == ExprT.ARITHMETIC or p[1].type.value <= ExprT.STRING.value) and p[3].type == ExprT.ARITHMETIC:
+                v = p[1].value * p[3].value
+                p[0] = Expression(
+                    ExprT.ARITHMETIC if p[1].type == ExprT.ARITHMETIC else ExprT.STRING,
+                    True,
+                    value=v
+                )
+            else:
+                err = True
+
+        elif p[2] == 'div':
+            if p[1].type == ExprT.ARITHMETIC and p[3].type == ExprT.ARITHMETIC:
+                v = p[1].value / p[3].value
+                p[0] = Expression(p[1].type, True, value=v)
+            else:
+                err = True
+
+        elif p[2] == 'mod':
+            if p[1].type == ExprT.ARITHMETIC and p[3].type == ExprT.ARITHMETIC:
+                v = p[1].value % p[3].value
+                p[0] = Expression(p[1].type, True, value=v)
+            else:
+                err = True
+
         elif p[2] == '++':
-            if p[1].type == ExprT.LIST:
+            if p[1].type == ExprT.ARRAY:
                 p[1].value.extend(
-                    [i for i in p[3].value] if p[3].type == ExprT.LIST else [
+                    [i for i in p[3].value] if p[3].type == ExprT.ARRAY else [
                         Expression(p[3].type, False, None, p[3].value, True)]
                 )
                 v = p[1].value
@@ -491,10 +617,14 @@ def p_expr(p):
 
 def p_assignexpr(p):
     '''
-    assignexpr : lvalue EQUAL expr
-               | lvalue COLON expr
+    assignexpr : lvalue ASSIGN_VAR expr
+               | lvalue ASSIGN_CONST expr
     '''
-    if p[2] == ':':
+    if p[1].indexed == True and p[1].arrayItem == False:
+        p[0] = afterErrorExpression
+        UI.emitError(G.Error(
+            'Tried to change contents of an immuatable STRING-based type', p.lineno(1)))
+    elif p[2] == '.=':
         if p[1].value == None or not p[1].const:
             if p[1].type.isStrict():
                 if p[1].type != p[3].type and p[3].type != ExprT.STRING:
@@ -506,33 +636,33 @@ def p_assignexpr(p):
                     sym = p[1].symbol
                     val = p[3].value
 
-                    # assert p[1].symbol != None
-                    if p[1].listItem == True:
+                    if p[1].arrayItem == True:
                         p[0] = afterErrorExpression
                         UI.emitError(
-                            G.Error('A list item can not be constant', p.lineno(2)))
+                            G.Error('An array item can not be constant', p.lineno(2)))
                     else:
                         sym.value = val
                         sym.const = True
-                        symbolTable.insert(sym)
+                        symbolTable.update(sym)
+
+                        if sym.name == '$GALAKTION_ROOT':
+                            os.chdir(val)
 
                         p[0] = Expression(
                             p[1].type,
                             True,
-                            # symbol=sym,
                             value=val,
-                            listItem=p[1].listItem
+                            arrayItem=p[1].arrayItem
                         )
             elif p[1].type.isFlex():
                 typ = p[3].type
                 sym = p[1].symbol
                 val = p[3].value
 
-                # assert p[1].symbol != None
-                if p[1].listItem == True:
+                if p[1].arrayItem == True:
                     p[0] = afterErrorExpression
                     UI.emitError(
-                        G.Error('A list item can not be constant', p.lineno(2)))
+                        G.Error('An array item can not be constant', p.lineno(2)))
                 else:
                     sym.value = val
                     sym.const = True
@@ -541,14 +671,13 @@ def p_assignexpr(p):
                     else:
                         sym.type = SymT.flexible if typ.isFlex(
                         ) else SymT(int(typ))
-                    symbolTable.insert(sym)
+                    symbolTable.update(sym)
 
                     p[0] = Expression(
                         typ,
                         True,
-                        # symbol=sym,
                         value=val,
-                        listItem=p[1].listItem
+                        arrayItem=p[1].arrayItem
                     )
             else:
                 assert False
@@ -556,7 +685,7 @@ def p_assignexpr(p):
             UI.emitError(G.Error(
                 'Assignment to a constant', p.lineno(2)))
             p[0] = afterErrorExpression
-    else:   # p[2] == EQUAL
+    else:   # p[2] == ASSIGN_VAR
         if p[1].const:
             UI.emitError(G.Error(
                 'Assignment to a constant', p.lineno(2)))
@@ -571,30 +700,27 @@ def p_assignexpr(p):
                 sym = p[1].symbol
                 val = p[3].value
 
-                # assert p[1].symbol != None
-                if p[1].listItem == True:
+                if p[1].arrayItem == True:
                     p[1].value = val
                 else:
                     sym.value = val
-                    symbolTable.insert(sym)
+                    symbolTable.update(sym)
 
-                    if sym.name == 'GALAKTION_ROOT':
+                    if sym.name == '$GALAKTION_ROOT':
                         os.chdir(val)
 
                 p[0] = Expression(
                     p[1].type,
                     False,
-                    # symbol=sym,
                     value=val,
-                    listItem=p[1].listItem
+                    arrayItem=p[1].arrayItem
                 )
         elif p[1].type.isFlex():
             typ = p[3].type
             sym = p[1].symbol
             val = p[3].value
 
-            # assert p[1].symbol != None
-            if p[1].listItem == True:
+            if p[1].arrayItem == True:
                 p[1].type = typ
                 p[1].value = val
             else:
@@ -605,14 +731,13 @@ def p_assignexpr(p):
                 else:
                     sym.type = SymT.flexible if typ.isFlex(
                     ) else SymT(int(typ))
-                symbolTable.insert(sym)
+                symbolTable.update(sym)
 
             p[0] = Expression(
                 typ,
                 False,
-                # symbol=sym,
                 value=val,
-                listItem=p[1].listItem
+                arrayItem=p[1].arrayItem
             )
         else:
             assert False
@@ -622,8 +747,8 @@ def p_augmassignexpr(p):
     '''
     augmassignexpr : lvalue augmassign expr
     '''
-    op = p[2][0]
-    asgn = p[2][1]
+    asgn, op = p[2]
+    asgn += '='
 
     p[2] = op
     p_expr(p)
@@ -636,14 +761,20 @@ def p_augmassignexpr(p):
 
 def p_augmassign(p):
     '''
-    augmassign : PLUS_EQUAL
-               | MINUS_EQUAL
-               | PLUS_PLUS_EQUAL
-               | PLUS_COLON
-               | MINUS_COLON
-               | PLUS_PLUS_COLON
+    augmassign : MINUS_ASSIGN_VAR
+               | PLUS_ASSIGN_VAR
+               | MUL_ASSIGN_VAR
+               | DIV_ASSIGN_VAR
+               | MOD_ASSIGN_VAR
+               | EXTEND_ASSIGN_VAR
+               | MINUS_ASSIGN_CONST
+               | PLUS_ASSIGN_CONST
+               | MUL_ASSIGN_CONST
+               | DIV_ASSIGN_CONST
+               | MOD_ASSIGN_CONST
+               | EXTEND_ASSIGN_CONST
     '''
-    p[0] = (p[1][:-1], p[1][-1])
+    p[0] = (p[1][0], p[1][1:])
     p.set_lineno(0, p.lineno(1))
 
 
@@ -700,40 +831,18 @@ def p_term(p):
 def p_primary(p):
     '''
     primary : lvalue
-            | listdef
-            | srcelement XML_ATTRIBUTE
+            | arraydef
             | const
+            | sliced
     '''
-    if type(p[1]) == Expression:
-        p[0] = p[1]
-    else:
-        attr = p[1].attrib[p[2]]
-
-        if attr == None:
-            p[0] = afterErrorExpression
-            UI.emitWarning(
-                G.Warning('Failed to find xml attribute', p.lineno(0)))
-        else:
-            p[0] = Expression(
-                ExprT.STRING,
-                True,
-                None,
-                attr
-            )
-
-
-def p_srcelement(p):
-    '''
-    srcelement : empty
-    '''
-    p[0] = currentSrcElement
+    p[0] = p[1]
 
 
 def p_lvalue(p):
     '''
     lvalue : ID
            | decl
-           | listitem
+           | indexed
     '''
     if type(p[1]) == str:
         if not symbolTable.lookup(p[1]):
@@ -743,24 +852,8 @@ def p_lvalue(p):
         else:
             sym = symbolTable.get(p[1])
 
-            t = ExprT(sym.type.value)
-
-            if sym.type == SymT.flexible:
-                if sym.value == None:
-                    t = ExprT.NONE
-                elif type(sym.value) == int or type(sym.value) == float:
-                    t = ExprT.ARITHMETIC
-                elif type(sym.value) == str:
-                    t = ExprT.STRING
-                elif type(sym.value) == bool:
-                    t = ExprT.BOOLEAN
-                elif type(sym.value) == list:
-                    t = ExprT.LIST
-                else:
-                    assert False
-
             p[0] = Expression(
-                t,
+                ExprT.bySymbol(sym),
                 sym.const,
                 symbol=sym,
                 value=sym.value
@@ -769,9 +862,9 @@ def p_lvalue(p):
         p[0] = p[1]
 
 
-def p_listdef(p):
+def p_arraydef(p):
     '''
-    listdef : BRACE_L exprlist BRACE_R
+    arraydef : BRACE_L exprlist BRACE_R
     '''
     val = []
     for i in p[2]:
@@ -780,35 +873,68 @@ def p_listdef(p):
             False,
             None,
             i.value,
-            listItem=True
+            arrayItem=True
         ))
 
     p[0] = Expression(
-        ExprT.LIST,
+        ExprT.ARRAY,
         True,
         None,
         val
     )
 
 
-def p_listitem(p):
-    # TODO check this grammar!!
+def p_indexed(p):
     '''
-    listitem : primary index
-             | primary slice
+    indexed : expr index
     '''
-    if p[1].type != ExprT.LIST:
+    if p[1].type != ExprT.ARRAY and p[1].type.value > ExprT.STRING.value:
         p[0] = afterErrorExpression
         UI.emitError(
-            G.Error('Attempted to index or slice non-list type', p.lineno(1)))
-    elif type(p[2]) == G.Index:
-        p[0] = p[1].value[p[2].index]
+            G.Error('Cannot index type ' + p[1].type.name, p.lineno(1)))
+    else:
+        if p[2].index_galaktion == 0:
+            t = ExprT.STRING
+            v = ''
+            if p[1].type == ExprT.ARRAY:
+                t = ExprT.ARRAY
+                v = []
+
+            # the 2 last are False in order an error not to be caused at assignexpr rule, first if statement
+            p[0] = Expression(t, True, None, v, arrayItem=False, indexed=False)
+        else:
+            p[0] = Expression(
+                ExprT.STRING,
+                True,
+                None,
+                p[1].value[p[2].index_python],
+                arrayItem=False,
+                indexed=True
+            )
+
+            if p[1].type == ExprT.ARRAY:
+                p0 = p[1].value[p[2].index_python]
+
+                assert p0.arrayItem == True
+                p0.indexed = True
+
+                p[0] = p0
+
+
+def p_sliced(p):
+    '''
+    sliced : expr slice
+    '''
+    if p[1].type != ExprT.ARRAY and p[1].type.value > ExprT.STRING.value:
+        p[0] = afterErrorExpression
+        UI.emitError(
+            G.Error('Cannot slice type ' + p[1].type.name, p.lineno(1)))
     else:
         p[0] = Expression(
-            ExprT.LIST,
+            ExprT.ARRAY if p[1].type == ExprT.ARRAY else ExprT.STRING,
             True,
             None,
-            p[1].value[p[2].start: p[2].stop]
+            p[1].value[p[2].start_python: p[2].stop_python]
         )
 
 
@@ -819,14 +945,14 @@ def p_decl(p):
     '''
     if len(p) == 2:
         p[0] = Expression(
-            ExprT(SymT.fromStr(p[1]).value),
+            ExprT(SymT.byName(p[1]).value),
             True,
             symbol=None,
             value=None
         )
     else:
-        sym = Symbol(SymT.fromStr(p[1]), False, p[2], None)
-        symbolTable.insert(sym)
+        sym = Symbol(SymT.byName(p[1]), False, p[2], None)
+        symbolTable.update(sym)
 
         p[0] = Expression(
             ExprT(sym.type.value),
@@ -870,11 +996,9 @@ def p_printstmt(p):
 
     what2print = ''
     for e in p[2]:
-        what2print += str(e) + ' '
+        what2print += str(e)
 
-    print(what2print[:-1])
-
-    p[0] = None
+    print(what2print, flush=True)
 
 
 def p_exprlist(p):
@@ -894,7 +1018,7 @@ def p_exprlist(p):
 
 def p_const(p):
     '''
-    const : STRING_VALUE
+    const : STRING_LITERAL
           | number
           | TRUE
           | FALSE
@@ -923,7 +1047,7 @@ def p_const(p):
         )
     elif type(p[1]) == Expression:
         p[0] = p[1]
-    else:   # STRING_VALUE
+    else:   # STRING_LITERAL
         p[0] = Expression(
             ExprT.STRING,
             True,
@@ -966,11 +1090,8 @@ def p_generatestmt(p):
     '''
     t = p[2].type
 
-    p[0] = afterErrorExpression
-
-    if p[2] == afterErrorExpression:
+    if p[2] is afterErrorExpression:
         UI.emitError(G.Error('Invalid declaration', p.lineno(2)))
-        return
 
     if not Checks.isTypeGeneratable(t):
         UI.emitError(
@@ -982,41 +1103,32 @@ def p_generatestmt(p):
                      str(p[2].type.name), p.lineno(4)))
         return
 
-    p[0] = None
-
-    if p[2].symbol != None and not p[2].symbol.name.startswith(symbolTable._temporarySymbolPrefix):
+    if p[2].symbol != None and not G.SymbolTable.isHiddenSymbol(p[2].symbol):
         p[2].symbol.value = p[3]
-        symbolTable.insert(p[2].symbol)
+        symbolTable.update(p[2].symbol)
         p[2].value = p[2].symbol.value
 
     try:
         if t == ExprT.jsonfile:
-            # print('Genarating json file...')
             with open(p[3], 'w') as out:
-                out.write(json.dumps(list(G.memory.values()), indent=4))
-            # print('ok')
+                try:
+                    out.write(json.dumps(list(G.memory.values()), indent=4))
+                except (UnicodeEncodeError, UnicodeDecodeError, UnicodeError):
+                    UI.emitWarning(G.Warning(
+                        "Something went wrong with the encoding", p.lineno(1)))
         else:  # t == ExprT.csvfile
-            # print('Generating csv file...')
-
-            with open('Galaktion_temp.json', 'w') as out:
-                out.write(json.dumps(list(G.memory.values()), indent=4))
-
-            with open('Galaktion_temp.json', 'r') as temp:
-                df = pd.read_json(temp)
-            df.to_csv(p[3], index=False)  # TODO delimiters
-
-            os.remove('Galaktion_temp.json')
-
-            # print('ok')
-
-            # p[0] = p[2]
-    except PermissionError:
+            try:
+                df = pd.json_normalize(G.memory.values())
+                df.to_csv(p[3], index=False)
+            except (UnicodeEncodeError, UnicodeDecodeError, UnicodeError):
+                UI.emitWarning(
+                    "Something went wrong with the encoding", p.lineno(1))
+    except Exception as e:
         UI.emitWarning(
-            G.Warning('Could not generate file "' + p[3] + '"', p.lineno(1)))
-        p[0] = None
+            G.Warning('Could not generate file "' + p[3] + '" - ' + str(e), p.lineno(1)))
 
-    if '@flush' in p[4]:
-        p[4].remove('@flush')
+    if Directives.flush in p[4]:
+        p[4].remove(Directives.flush)
 
         G.memory.clear()
 
@@ -1027,45 +1139,47 @@ def p_generatestmt(p):
 
 def p_fromstmt(p):
     '''
-    fromstmt : FROM lvalue
-             | FROM assignexpr
-             | FROM lvalue BLOCK_WITH_CODE
-             | FROM assignexpr BLOCK_WITH_CODE
+    fromstmt : FROM expr
+             | FROM expr BLOCK_WITH_CODE
     '''
-    global activRecs, srcFiles
+    global userSrcFiles
 
-    if p[2].symbol.type != SymT.xmlfile:
+    if p[2].type != ExprT.xmlfile:
         p[0] = afterErrorExpression
-        UI.emitError(
-            G.Error('"from" statement excpects a "xmlfile" type', p.lineno(2)))
-        return
-
-    if len(p) == 3:
-        srcFiles.pop()
-        srcFiles.push(p[2].symbol.value)
+        UI.emitError(G.Error(
+            '"from" statement excpects an expression of type "xmlfile"', p.lineno(2)))
+    elif len(p) == 3:
+        userSrcFiles.pop()
+        userSrcFiles.push(p[2].value)
     else:
-        srcFiles.push(p[2].symbol.value)
+        userSrcFiles.push(p[2].value)
+        parser.parse(p[3][1:-1], lexer=newLexer(p.lineno(3)))
+        userSrcFiles.pop()
 
-        activRecs.push(ActivationRecord(
-            lexer=newLexer(),
-            code=p[3][1:-1]
-        ))
-        parser.parse(activRecs.top().code, lexer=activRecs.top().lexer)
-        activRecs.pop()
 
-        srcFiles.pop()
+def jsonSerializable(expr: Expression):
+    assert expr.type == ExprT.ARRAY
 
-    p[0] = p[2]
+    ret = []
+
+    for i in expr.value:
+        if i.type != ExprT.ARRAY:
+            ret.append(i.value)
+        else:
+            ret.append(jsonSerializable(i))
+
+    return ret
 
 
 def p_extractstmt(p):
     '''
     extractstmt : EXTRACT expr name drctvs
     '''
-    global activRecs
-
-    key = p[3] if p[3] else ''
+    key = p[3]
     val = p[2].value
+
+    if p[2].type == ExprT.ARRAY:
+        val = jsonSerializable(p[2])
 
     if p[4] != None:
         # The set is not empty, so it contains directives.
@@ -1073,16 +1187,16 @@ def p_extractstmt(p):
         # remove it from the set.
         # This is important for the warning at the last step.
 
-        if '@latlong' in p[4]:
-            p[4].remove('@latlong')
+        if Directives.latlong in p[4]:
+            p[4].remove(Directives.latlong)
 
             if val:
                 if type(val) == list:
                     val = [getLatLong(i) for i in val]
                 else:
                     val = getLatLong(val)
-        elif '@longlat' in p[4]:
-            p[4].remove('@longlat')
+        elif Directives.longlat in p[4]:
+            p[4].remove(Directives.longlat)
 
             if val:
                 if type(val) == list:
@@ -1090,199 +1204,235 @@ def p_extractstmt(p):
                 else:
                     val = getLongLat(val)
 
-    if G.memory.get(srcFiles.top().path, None) == None:
-        G.memory[srcFiles.top().path] = {}
+    srcFile = userSrcFiles.top()
 
-    G.memory[srcFiles.top().path][key] = val
-    activRecs.top().linkingFiles = []
+    if G.memory.get(srcFile, None) == None:
+        G.memory[srcFile] = {}
+
+    G.memory[srcFile][key] = val
 
     # At this point, if a directive is still contained
-    # in the set, means that it was not processed (because
+    # in the set, it means that it was ignored (because
     # was invalid for extract statement).
     # If so, throw a warning.
     if len(p[4]) > 0:
         UI.emitWarning(
-            G.Warning('One or more directives were ignored', p.lineno(1)))
+            G.Warning('One or more directives were ignored', p.lineno(4)))
 
 
 def p_name(p):
     '''
-    name : AS STRING_VALUE
+    name : AS expr
     '''
-    p[0] = p[2]
-
-
-def p_tagslinks(p):
-    '''
-    tagslinks : tags
-              | tagslinks update_files ARROW tags
-    '''
-    val = []
-
-    for f in activRecs.top().linkingFiles:
-        for e in f.elements:
-            if e == None:
-                pass  # TODO !
-            else:
-                val.append(e.text)
-
-    if len(val) == 0:
-        p[0] = Expression(
-            ExprT.NONE,
-            True,
-            symbol=None,
-            value=None
-        )
-    elif len(val) == 1:
-        p[0] = Expression(
-            ExprT.STRING,
-            True,
-            symbol=None,
-            value=val[0]
-        )
-    else:
-        p[0] = Expression(
-            ExprT.LIST,
-            True,
-            symbol=None,
-            value=val
-        )
-
-
-def p_update_files(p):
-    '''
-    update_files : empty
-    '''
-    global activRecs, currentSrcElement
-
-    # if symbolTable.get('GALAKTION_ROOT').value == None:  # TODO
-    #     p[0] = afterErrorExpression
-    #     UI.emitError(G.Error(
-    #         'GALAKTION_ROOT must be initialized'))
-    # el
-    if linkCode == None:
+    if p[2].type.value > ExprT.STRING.value:
         p[0] = afterErrorExpression
-        UI.emitError(G.Error("Undefined code block for '->'"))
+        UI.emitError(G.Error(
+            'Expected expression of string-based type, but got of type ' + p[2].type.name, p.lineno(2)))
     else:
-        r = symbolTable.get('GALAKTION_ROOT').value
-        newFiles = []
+        p[0] = p[2].value
 
-        for f in activRecs.top().linkingFiles:
-            for element in f.elements:
-                # if element == None:
-                #     UI.emitWarning(
-                #         G.Warning(f.path + ': Tag was not found FROM UPDATE_FILES'))
-                # else:
-                currentSrcElement = element
-                path = getPath2File(r)
-                currentSrcElement = None
 
-                if path == None:
+def p_linkedxpathsexpr(p):
+    '''
+    linkedxpathsexpr : linkedxpaths
+    '''
+
+    xpathResultsExprs = []
+
+    # Eliminate XML element/node results
+    for result in p[1]:
+        if type(result) != etree._Element:
+            xpathResultsExprs.append(
+                Expression(
+                    type=ExprT.byValue(result),
+                    symbol=None,
+                    value=result,
+                    arrayItem=True,
+                    const=False
+                )
+            )
+
+    if len(xpathResultsExprs) == 1:
+        p[0] = xpathResultsExprs[0]
+        p[0].arrayItem = False
+        p[0].const = True
+    else:
+        p[0] = Expression(
+            ExprT.ARRAY,
+            True,
+            None,
+            xpathResultsExprs
+        )
+
+
+def p_linkedxpaths(p):
+    '''
+    linkedxpaths : xpath
+                 | linkedxpaths ARROW xpath
+    '''
+    global currentSrcElement
+
+    if len(p) == 2:
+        if userSrcFiles.size() == 0:
+            p[0] = afterErrorExpression
+            UI.emitError(G.Error('No source XML file spcified', p.lineno(1)))
+        else:
+            file = None
+            err = False
+
+            xpathVars, undeclaredVars = getDynamicXPathVariables(p[1])
+
+            if len(undeclaredVars) > 0:
+                err = True
+                UI.emitError(G.Error('Undeclared identifier'+(''if len(undeclaredVars)
+                             == 1 else 's')+': '+str(undeclaredVars), p.lineno(1)))
+            else:
+                try:
+                    if currentSrcElement == None:
+                        val = etree.parse(userSrcFiles.top()).xpath(
+                            p[1], **xpathVars)
+                    else:  # when executing link code
+                        val = currentSrcElement.xpath(p[1], **xpathVars)
+                except FileNotFoundError:
                     UI.emitWarning(
-                        G.Warning(f.path + ': "' + element.tag + '" tag: Failed to link'))
+                        G.Warning(f'Source file "{userSrcFiles.top()}" not found by XPath expressions "{p[1]}"', p.lineno(1)))
+                except (etree.XPathSyntaxError, etree.XPathEvalError) as e:
+                    err = True
+                    UI.emitError(
+                        G.Error('Invalid XPath expression: '+str(e), p.lineno(1)))
+                except Exception as e:
+                    err = True
+                    UI.emitError(
+                        G.Error(f'Unexpected error {userSrcFiles.top()}: ' + str(e), p.lineno(1)))
                 else:
-                    newFiles.append(G.SourceFile(path))
+                    if type(val) != list:
+                        val = [val]
+                    p[0] = val
 
-        activRecs.top().linkingFiles = newFiles
+        if err:
+            p[0] = afterErrorExpression
+    else:
+        if linkCode == None:
+            p[0] = afterErrorExpression
+            UI.emitError(G.Error('Undefined code block for "->"', p.lineno(2)))
+        elif symbolTable.get('$GALAKTION_ROOT').value == None:
+            p[0] = afterErrorExpression
+            UI.emitError(
+                G.Error('In order to use "->", $GALAKTION_ROOT must be set', p.lineno(2)))
+        else:
+            # Perform linking...
+            xpathResults = p[1]
+            xpathResults_new = []
+
+            for r in xpathResults:
+                if type(r) == etree._Element:
+                    currentSrcElement = r
+                    r = getPath2File(symbolTable.get('$GALAKTION_ROOT').value)
+                    if r == None:
+                        file = currentSrcElement.getroottree().docinfo.URL
+                        elementPath = currentSrcElement.getroottree().getpath(currentSrcElement)
+                        UI.emitWarning(G.Warning(
+                            f'{file}: {elementPath}: Could not link', p.lineno(2)))
+                    currentSrcElement = None
+
+                if r != None:
+                    if type(r) != list:
+                        r = [r]
+                    xpathResults_new.extend(r)
+
+            xpathResults = xpathResults_new
+
+            err = False
+            xpathVars, undeclaredVars = getDynamicXPathVariables(p[3])
+
+            if len(undeclaredVars) > 0:
+                err = True
+                UI.emitError(G.Error('Undeclared identifier'+(''if len(undeclaredVars)
+                             == 1 else 's')+': '+str(undeclaredVars), p.lineno(1)))
+            else:
+                xpathResults_new = []
+                for r in xpathResults:
+                    try:
+                        if type(r) == str:
+                            val = etree.parse(r).getroot().xpath(
+                                p[3], **xpathVars)
+                        elif type(r) == etree._Element:
+                            assert False
+                        else:
+                            val = r
+                    except FileNotFoundError:
+                        UI.emitWarning(
+                            G.Warning(f'Source file "{r}" not found by XPath expressions "{p[1]}"', p.lineno(1)))
+                    except (etree.XPathSyntaxError, etree.XPathEvalError) as e:
+                        err = True
+                        UI.emitError(
+                            G.Error('Invalid XPath expression: '+str(e), p.lineno(1)))
+                    else:
+                        if type(val) != list:
+                            val = [val]
+                        xpathResults_new.extend(val)
+
+                xpathResults = xpathResults_new
+                p[0] = xpathResults
+            if err:
+                p[0] = afterErrorExpression
 
 
-def p_tags(p):
+def p_xpath(p):
     '''
-    tags : tag
-         | tags SLASH XML_TAG sliceorindex
+    xpath : MUL
+          | PATH
+          | PATH PAR_PATH
+          | xpath predicates
+          | xpath index
+          | xpath slice
+          | xpath PATH
+          | xpath PATH PAR_PATH
+          | PAR_L xpath PAR_R
     '''
-    global activRecs
+    if len(p) == 2:
+        p[0] = p[1]
 
+    else:
+        if type(p[2]) == G.Index:
+            p2 = '[' + p[2].index_xpath + ']'
+        elif type(p[2]) == G.Slice:
+            p2 = '[' + p[2].start_stop_xpath + ']'
+
+            if p2 == '[]':
+                p2 = ''
+        else:
+            p2 = p[2]
+
+        p3 = ''
+        if len(p) == 4:
+            p3 = p[3]
+
+        p[0] = p[1] + p2 + p3
+
+
+def p_predicates(p):
+    '''
+    predicates : PREDICATE
+               | predicates PREDICATE
+    '''
     if len(p) == 2:
         p[0] = p[1]
     else:
-        p[0] = p[1] + '/' + p[3] + ('' if p[4] == None else str(p[4]))
-
-        for i in range(len(activRecs.top().linkingFiles)):
-            newl = []
-
-            for element in activRecs.top().linkingFiles[i].elements:
-                l = element.findall(p[3])
-
-                if len(l) == 0:
-                    UI.emitWarning(G.Warning(
-                        activRecs.top().linkingFiles[i].path + ': Tag "' + p[3] + '" was not found'))
-                    continue
-
-                # TODO handle out of range indeces
-                if type(p[4]) == G.Index:
-                    newl.extend([l[p[4].index]])
-                elif type(p[4]) == G.Slice:
-                    newl.extend(l[p[4].start: p[4].stop])
-                else:  # p[4] == None
-                    # newl.append(l[0])
-                    newl.extend(l)
-
-            activRecs.top().linkingFiles[i].elements = newl
-
-
-def p_tag(p):
-    '''
-    tag : SLASH XML_TAG sliceorindex
-    '''
-    global activRecs
-
-    p[0] = p[2] + ('' if p[3] == None else str(p[3]))
-
-    try:
-        # print('try:', activRecs)
-        if len(activRecs.top().linkingFiles) == 0:
-            if srcFiles.isEmpty():
-                UI.emitError(G.Error('No source file specified', p.lineno(1)))
-                p[0] = afterErrorExpression
-            else:
-                # print(srcFiles.top().path)
-                activRecs.top().linkingFiles.append(G.SourceFile(srcFiles.top().path))
-    except AttributeError:
-        print('except', activRecs)
-        pass
-
-    for i in range(len(activRecs.top().linkingFiles)):
-        l = ET.parse(
-            activRecs.top().linkingFiles[i].path).getroot().findall(p[2])
-
-        if len(l) == 0:
-            UI.emitWarning(G.Warning(
-                activRecs.top().linkingFiles[i].path + ': Tag "' + p[2] + '" was not found'))
-            continue
-
-        # TODO handle out of range indeces
-        if type(p[3]) == G.Index:
-            l = [l[p[3].index]]
-        elif type(p[3]) == G.Slice:
-            l = l[p[3].start: p[3].stop]
-        else:  # p[3] == None
-            # l = [l[0]]
-            pass
-
-        activRecs.top().linkingFiles[i].elements = l
-
-
-def p_sliceorindex(p):
-    '''
-    sliceorindex : empty
-                 | slice
-                 | index
-    '''
-    p[0] = None if p[1] == None else p[1]
+        p[0] = p[1] + p[2]
 
 
 def p_slice(p):
     '''
-    slice : BRACE_L expr COLON_COLON expr BRACE_R
-          | BRACE_L COLON_COLON expr BRACE_R
-          | BRACE_L expr COLON_COLON BRACE_R
-          | BRACE_L COLON_COLON BRACE_R
+    slice : BRACE_L expr SLICER expr BRACE_R
+          | BRACE_L SLICER expr BRACE_R
+          | BRACE_L expr SLICER BRACE_R
+          | BRACE_L SLICER BRACE_R
     '''
     if len(p) == 4:
         p[0] = G.Slice(G.Index(None), G.Index(None))
     elif len(p) == 5:
-        if p[2] == ':':
+        if p[2] == '~':
             p[0] = G.Slice(
                 G.Index(None),
                 checkIndex(p[3], p.lineno(3))
@@ -1305,38 +1455,48 @@ def p_index(p):
     '''
     p[0] = checkIndex(p[2], p.lineno(2))
 
+##############################################################
+
 
 ##############   I N I T I A L I Z A T I O N   ###############
 
-symbolTable.insert(Symbol(SymT.folder, False, 'GALAKTION_ROOT', os.getcwd()))
+symbolTable.update(
+    Symbol(
+        type=SymT.folder,
+        const=False,
+        name='$GALAKTION_ROOT',
+        value=os.getcwd()
+    )
+)
+
+##############################################################
 
 
-argParser = argparse.ArgumentParser()
-argParser.add_argument('input_file')
-
-args = argParser.parse_args()
+########################   R U N   ###########################
 
 try:
-    inp = open(args.input_file, 'r')
+    with open(UI.userSourceFile, 'r') as inp:
+        parserInput = inp.read()
 except FileNotFoundError:
     UI.print('Error: Input file not found')
     sys.exit()
-parserInput = inp.read()
-inp.close()
 
 
+# Test Input (uncomment to use)
 # parserInput = '''
-# generate jsonfile testFile as 'f'
-# generate csvfile testFile as 'f'
-
-# generate xmlfile testFile as 'f'
+#
 # '''
 
 
-parser = yacc.yacc()
+parser = yacc.yacc()  # Create the parser object.
 
 try:
-    parser.parse(parserInput, lexer=activRecs.top().lexer)
+    parser.parse(parserInput, lexer=newLexer(1))
 except KeyboardInterrupt:
     UI.print('Aborting...')
     sys.exit()
+
+UI.printWarnings()
+UI.printErrors()
+
+##############################################################

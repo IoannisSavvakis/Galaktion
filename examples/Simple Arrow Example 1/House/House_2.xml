@@ -1,0 +1,9 @@
+<House>
+    <id>2</id>
+    <Area>110</Area>
+    <Location type="Country" id="2" />
+    <Residents>
+        <CurrentResident type="Person" id="6" />
+        <PreviousResident type="Person" id="2" />
+    </Residents>
+</House>

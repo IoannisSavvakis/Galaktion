@@ -1,0 +1,112 @@
+
+
+` Setting the cwd where is convinient for this case `
+$GALAKTION_ROOT .= 'D:/CSD-Codes/Thesis/RICONTRANS_DATA_2023-10-24'
+
+
+` Setting the cwd where is convinient for this case `
+` $GALAKTION_ROOT .= 'path / to /RICONTRANS_DATA_2023-10-24' `
+
+
+`Definition of arrow's code block`
+-> {
+    @sps_type + @sps_id + '.xml'    #filename ,
+    @sps_type                       #filelocation #subfolders
+}
+
+
+` Declare $myFile that will represent the XML file
+  at the specified location and make it constant. `
+xmlfile $myFile .= 'Objects/3/Objects2159.xml'
+
+
+from $myFile {
+    if //admin/saved/text() != 'yes' { ` If the file is not saved... `
+        print $myFile, " - not saved" ` ...print a message... `
+        exit ` ...and stop execution. `
+    }
+
+
+    ` store the value of $myFile `
+    ` as 'Source File' `
+    extract $myFile as 'Source File'
+
+
+    ` Create the constant $materials that holds `
+    ` the texts of all PrincipalMaterial nodes  `
+    ` and store it as 'Materials'. `
+    flexible $materials .= //PrincipalMaterial/text()
+    extract $materials as 'Materials'
+
+
+    ` The lines below retrieve the attributes `
+    ` sps_type and sps_id  of node `
+    ` CurrentLocation/Location from wherever inside `
+    ` $myFile this is. `
+    ` As attributes are always strings, these three `
+    ` additions will conclude in a single string which `
+    ` which will be stored as 'Location specs'. `
+    extract   //CurrentLocation/Location/@sps_type
+            + //CurrentLocation/Location/@sps_id
+            + '.xml' 
+    as 'Location specs'
+
+
+    ` find the node CurrentLocation/Location inside the $file `
+    ` and using -> go to the file that it indicates `
+    ` and inside that file, find the node Name, get its text `
+    ` and store it as 'Location Name' `
+    extract //CurrentLocation/Location->Name/text() as 'Location Name'
+
+
+    `find the node CurrentLocation/Location inside the $file 
+     and using the -> go to the file that it indicates
+     and inside that file, find the node Coordinates/Value,
+     get its text, convert it to lat and long and store it as
+     'Location Coordinates' `
+    extract //CurrentLocation/Location->Coordinates/Value/text() as 'Location Coordinates' #latlong
+
+
+    ` Declare the constant $id containing the text of admin/id `
+    flexible $id .= //admin/id/text()
+
+
+    ` L1: find the nodes ref_by under refs_by that have an attribute `
+    `     sps_type with value "ObjectTransfers" and from each one of `
+    `     them go to the file that each indicates. From there, `
+    ` L2: find the nodes Object under MovedObject, go to the files `
+    `     that each indicates, and from there `
+    ` L3: find the nodes Location under CurrentLocation, go to the `
+    `     files that each indicates. From there, `
+    ` L4: find the nodes ref_by that have an attribute sps_type `
+    `     with value "Objects" and one sps_id with different value  `
+    `     from the $id constant, keep only the first five, and go `
+    `     to the files that they indicate. From there, `
+    ` L5: find the nodes id under admin  and get their texts and `
+    `     store them as `
+    `     'Other objects passed from the involved Locations'. `
+    extract //refs_by/ref_by[@sps_type="ObjectTransfers"]->
+            //MovedObject/Object->
+            //CurrentLocation/Location->
+            //ref_by[@sps_type='Objects' and @sps_id != $id][~5] `Keep only the first 5 elements` ->
+            //admin/id/text()
+    as 'Other objects passed through the involved Locations'
+}
+
+
+` Print a message with the last 15 character of $myFile. `
+print 'Done processing ', $myFile[-15~]
+
+
+` Generate a JSON file output.json in the specified location `
+` containing the data that have been extracted until now. `
+generate jsonfile as 'output.json'
+
+
+` Generate a CSV file output.csv in the specified location `
+` containing the data that have been extracted until now. `
+` After the process is complete, empty the internal memory (#flush). `
+generate csvfile as 'output.csv' #flush
+
+
+

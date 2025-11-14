@@ -1,0 +1,6 @@
+<Person>
+    <id>4</id>
+    <Name>George</Name>
+    <Origin type="Country" id="2" />
+    <CurrentSettlement type="Country" id="" />
+</Person>
