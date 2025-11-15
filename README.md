@@ -10,7 +10,7 @@ It works well, but it has many bugs and is not focused on performance. These wil
 <br><br>
 It uses XPath 1.0 expressions, a core feature of the language, to retrieve data from XML files and combines them with the arrow (->) to navigate through relationally linked XML files.
 <br><br>
-Galaktion is named after [saint Galaktion](https://www.saint.gr/2888/saint.aspx) (November 5th).
+Galaktion is named after saint Galaktion (November 5th).
 
 <br>
 
@@ -29,7 +29,7 @@ Future plans include the implementation of a Language Server Protocol.
 
 ## Simple Program
 This simple Galaktion program declares the `$myFile` variable of `xmlfile` type to represent the my_file.xml file of the Current Working Directory.<br>
-Then it uses an XPath expression to get the text of the node World under the node Hello from this file and prints it to the console.
+Then it uses an XPath expression to get the text of the node `World` under the node `Hello` from this file and print it to the console.
 ```
 xmlfile $myFile := './my_file.xml'
 
