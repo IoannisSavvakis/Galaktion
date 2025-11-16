@@ -21,7 +21,7 @@ Therefore, to use Galaktion, you have to clone this repository on your system an
 You must have Python installed.
 <br><br>
 Galaktion files have the extension __.gal__.<br>
-For writing Galaktion code inside a .gal file, a simple couloring extension for Visual Stusio Code is availble on this page. You can download it and install it into your VS Code extensions.
+For writing Galaktion code inside a .gal file, a simple coloring extension for Visual Stusio Code is availble at the Marketplace.
 <br><br>
 Future plans include the implementation of a Language Server Protocol.
 
