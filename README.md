@@ -8,7 +8,7 @@ Galaktion v0.2.0 is a simple general-purpose scripting imperative programming la
 This version is entirely implemented in Python.<br>
 It works well, but it has many bugs and is not focused on performance. These will be addressed in future versions.
 <br><br>
-It uses XPath 1.0 expressions, a core feature of the language, to retrieve data from XML files and combines them with the arrow (->) to navigate through relationally linked XML files.
+It uses XPath 1.0 expressions, a core feature of the language, to retrieve data from XML files and combines them with the arrow (->) to navigate through relationally linked XML files. Detailed discription can be found in _Thesis - Ioannis Savvakis.pdf_.
 <br><br>
 Galaktion is named after saint Galaktion (November 5th).
 
