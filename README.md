@@ -31,7 +31,7 @@ Future plans include the implementation of a Language Server Protocol.
 The following Galaktion code declares the `$myFile` variable of `xmlfile` type to represent the my_file.xml file of the Current Working Directory.<br>
 Then it uses an XPath expression to get the text of the node `World` under the node `Hello` from this file and print it to the console.
 <br><br>
-More expamples are available in the examples folder, includong the code used for the [RICONTRANS Map](https://github.com/IoannisSavvakis/RICONTRANS-Map) project.
+More expamples are available in the examples folder, including the code used for the [RICONTRANS Map](https://github.com/IoannisSavvakis/RICONTRANS-Map) project.
 <br><br>
 ```
 xmlfile $myFile := './my_file.xml'
